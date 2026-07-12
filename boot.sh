@@ -8,7 +8,7 @@ export DISK=/home/julian/vms/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
 sudo qemu-system-x86_64 \
   -enable-kvm \
   -m 8G \
-  -smp 8,sockets=8,cores=1,threads=1 \
+  -smp 8,sockets=2,dies=4,cores=1,threads=1 \
   -object memory-backend-ram,id=m0,size=1G \
   -object memory-backend-ram,id=m1,size=1G \
   -object memory-backend-ram,id=m2,size=1G \
