@@ -28,13 +28,18 @@ Division of labor between the user and Claude:
 
 ## Required workflow rules
 
-1. **Read EVERY memory file, ENTIRELY, before any work.** Before beginning the
-   actual task, read every memory file in the memory directory (every file
-   `MEMORY.md` links to), each one COMPLETE, start to finish — not a skim, not a
-   relevance-filtered subset, not the `MEMORY.md` one-line index entries alone.
-   The auto-loaded `MEMORY.md` index is NOT a substitute for the memories
-   themselves. Only once every memory file has been read in full do you begin
-   the actual task.
+1. **Startup: regenerate and read the full diff, then read EVERY memory file,
+   ENTIRELY, before any work.** Before beginning the actual task, in this
+   order: FIRST run `./diffall.sh` (regenerates `tlbopt700.txt`, the complete
+   diff of this tree against the stock 7.0.0 baseline commit, excluding
+   `boot.sh`); SECOND read `tlbopt700.txt` ENTIRELY, start to finish — not a
+   skim, not a selection of hunks. THEN read every memory file in the memory
+   directory (every file `MEMORY.md` links to), each one COMPLETE, start to
+   finish — not a skim, not a relevance-filtered subset, not the `MEMORY.md`
+   one-line index entries alone. The auto-loaded `MEMORY.md` index is NOT a
+   substitute for the memories themselves. Only once diffall.sh has run and
+   both `tlbopt700.txt` and every memory file have been read in full do you
+   begin the actual task.
 
 2. **Batch related changes; verify as you go.** There is no one-step-per-reply
    or one-file-per-reply limit — make as many edits across as many files as a
