@@ -13,6 +13,11 @@
 #include <linux/mmu_notifier.h>
 #include <linux/mmu_context.h>
 #include <linux/kvm_types.h>
+#include <linux/slab.h>
+#include <linux/topology.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/jump_label.h>
 
 #include <asm/tlbflush.h>
 #include <asm/mmu_context.h>
@@ -1344,6 +1349,367 @@ static bool should_trim_cpumask(struct mm_struct *mm)
 DEFINE_PER_CPU_SHARED_ALIGNED(struct tlb_state_shared, cpu_tlbstate_shared);
 EXPORT_PER_CPU_SYMBOL(cpu_tlbstate_shared);
 
+#ifdef CONFIG_SMP
+
+struct tlb_rep_request {
+	struct flush_tlb_info info;
+	smp_call_func_t func;
+	cpumask_var_t targets;
+	atomic_t pending;
+	call_single_data_t rep_csd;
+	call_single_data_t __percpu *leaf_csds;
+	int src_cpu;
+	int src_node;
+	unsigned int dst_pkg;
+} ____cacheline_aligned;
+
+struct tlb_rep_state {
+	struct tlb_rep_request *reqs;
+	call_single_data_t __percpu *leaf_csds;
+	cpumask_var_t direct_mask;
+};
+
+struct tlb_rep_stats {
+	u64 rep_flushes;
+	u64 kernel_rep_flushes;
+	u64 sockets_forwarded;
+	u64 cpus_forwarded;
+	u64 singleton_direct;
+	u64 offline_fallbacks;
+	u64 forwards_run;
+	u64 leaf_ipis_sent;
+	u64 leaf_flushes_run;
+};
+
+static DEFINE_PER_CPU(struct tlb_rep_state, tlb_rep_state);
+static DEFINE_PER_CPU(struct tlb_rep_stats, tlb_rep_stats);
+static DEFINE_STATIC_KEY_FALSE(tlb_rep_key);
+static int *tlb_rep_node;
+static unsigned int tlb_rep_pkgs;
+static bool tlb_rep_ready;
+
+static void tlb_rep_leaf_func(void *data)
+{
+	struct tlb_rep_request *req = data;
+
+	req->func(&req->info);
+	this_cpu_inc(tlb_rep_stats.leaf_flushes_run);
+	atomic_dec(&req->pending);
+}
+
+static void tlb_rep_forward_func(void *data)
+{
+	struct tlb_rep_request *req = data;
+	int this_cpu = smp_processor_id();
+	int cpu;
+
+	BUG_ON(topology_logical_package_id(this_cpu) != req->dst_pkg);
+
+	for_each_cpu(cpu, req->targets) {
+		call_single_data_t *csd;
+		int err;
+
+		if (cpu == this_cpu)
+			continue;
+
+		csd = per_cpu_ptr(req->leaf_csds, cpu);
+		csd->func = tlb_rep_leaf_func;
+		csd->info = req;
+		err = smp_call_function_single_async(cpu, csd);
+		if (err) {
+			BUG_ON(err != -ENXIO);
+			atomic_dec(&req->pending);
+			continue;
+		}
+		this_cpu_inc(tlb_rep_stats.leaf_ipis_sent);
+	}
+
+	this_cpu_inc(tlb_rep_stats.forwards_run);
+	req->func(&req->info);
+	atomic_dec(&req->pending);
+}
+
+static bool tlb_rep_flush_mask(const struct cpumask *cpumask,
+			       smp_call_func_t func,
+			       const struct flush_tlb_info *info,
+			       bool use_cond)
+{
+	struct tlb_rep_state *s;
+	unsigned int pkg, this_pkg;
+	int this_cpu, cpu;
+	bool used_rep = false;
+
+	if (!static_branch_unlikely(&tlb_rep_key))
+		return false;
+
+	if (unlikely(irqs_disabled() || oops_in_progress))
+		return false;
+
+	guard(preempt)();
+
+	this_cpu = smp_processor_id();
+	this_pkg = topology_logical_package_id(this_cpu);
+	s = this_cpu_ptr(&tlb_rep_state);
+
+	cpumask_clear(s->direct_mask);
+	for (pkg = 0; pkg < tlb_rep_pkgs; pkg++)
+		cpumask_clear(s->reqs[pkg].targets);
+
+	for_each_cpu_and(cpu, cpumask, cpu_online_mask) {
+		if (use_cond && !should_flush_tlb(cpu, (void *)info))
+			continue;
+		pkg = topology_logical_package_id(cpu);
+		if (pkg == this_pkg)
+			cpumask_set_cpu(cpu, s->direct_mask);
+		else
+			cpumask_set_cpu(cpu, s->reqs[pkg].targets);
+	}
+
+	for (pkg = 0; pkg < tlb_rep_pkgs; pkg++) {
+		struct tlb_rep_request *req = &s->reqs[pkg];
+		unsigned int nr = cpumask_weight(req->targets);
+		int rep_cpu = -1;
+		int err;
+
+		if (!nr)
+			continue;
+
+		if (nr == 1) {
+			cpumask_set_cpu(cpumask_first(req->targets),
+					s->direct_mask);
+			cpumask_clear(req->targets);
+			this_cpu_inc(tlb_rep_stats.singleton_direct);
+			continue;
+		}
+
+		for_each_cpu(cpu, req->targets) {
+			if (cpu_to_node(cpu) == tlb_rep_node[pkg]) {
+				rep_cpu = cpu;
+				break;
+			}
+		}
+		if (rep_cpu < 0)
+			rep_cpu = cpumask_first(req->targets);
+
+		BUG_ON(atomic_read(&req->pending));
+
+		if (info)
+			req->info = *info;
+		else
+			memset(&req->info, 0, sizeof(req->info));
+		req->func = func;
+		req->src_cpu = this_cpu;
+		req->src_node = cpu_to_node(this_cpu);
+		req->dst_pkg = pkg;
+		atomic_set(&req->pending, nr);
+
+		err = smp_call_function_single_async(rep_cpu, &req->rep_csd);
+		if (err) {
+			BUG_ON(err != -ENXIO);
+			atomic_set(&req->pending, 0);
+			cpumask_or(s->direct_mask, s->direct_mask,
+				   req->targets);
+			cpumask_clear(req->targets);
+			this_cpu_inc(tlb_rep_stats.offline_fallbacks);
+			continue;
+		}
+
+		used_rep = true;
+		this_cpu_inc(tlb_rep_stats.sockets_forwarded);
+		this_cpu_add(tlb_rep_stats.cpus_forwarded, nr);
+	}
+
+	if (used_rep) {
+		this_cpu_inc(tlb_rep_stats.rep_flushes);
+		if (func != flush_tlb_func)
+			this_cpu_inc(tlb_rep_stats.kernel_rep_flushes);
+	}
+
+	if (!cpumask_empty(s->direct_mask))
+		on_each_cpu_cond_mask(NULL, func, (void *)info, true,
+				      s->direct_mask);
+
+	for (pkg = 0; pkg < tlb_rep_pkgs; pkg++) {
+		while (atomic_read_acquire(&s->reqs[pkg].pending))
+			cpu_relax();
+	}
+
+	return true;
+}
+
+static int tlb_rep_online_cpu(unsigned int cpu)
+{
+	unsigned int pkg = topology_logical_package_id(cpu);
+	int node = cpu_to_node(cpu);
+
+	BUG_ON(pkg >= tlb_rep_pkgs);
+
+	if (tlb_rep_node[pkg] == NUMA_NO_NODE || node < tlb_rep_node[pkg])
+		tlb_rep_node[pkg] = node;
+
+	return 0;
+}
+
+static int tlb_rep_proc_show(struct seq_file *m, void *v)
+{
+	struct tlb_rep_stats sum = {};
+	unsigned int cpu, pkg;
+
+	for_each_possible_cpu(cpu) {
+		struct tlb_rep_stats *st = per_cpu_ptr(&tlb_rep_stats, cpu);
+
+		sum.rep_flushes		+= st->rep_flushes;
+		sum.kernel_rep_flushes	+= st->kernel_rep_flushes;
+		sum.sockets_forwarded	+= st->sockets_forwarded;
+		sum.cpus_forwarded	+= st->cpus_forwarded;
+		sum.singleton_direct	+= st->singleton_direct;
+		sum.offline_fallbacks	+= st->offline_fallbacks;
+		sum.forwards_run	+= st->forwards_run;
+		sum.leaf_ipis_sent	+= st->leaf_ipis_sent;
+		sum.leaf_flushes_run	+= st->leaf_flushes_run;
+	}
+
+	seq_puts(m, "TLB representative shootdown\n");
+	seq_puts(m, "============================\n");
+	seq_printf(m, "status                        : %s\n",
+		   static_branch_unlikely(&tlb_rep_key) ? "enabled" : "disabled");
+	seq_printf(m, "packages                      : %u\n", tlb_rep_pkgs);
+	seq_puts(m, "\n");
+	seq_puts(m, "Representative node per package\n");
+	seq_puts(m, "-------------------------------\n");
+	for (pkg = 0; pkg < tlb_rep_pkgs; pkg++)
+		seq_printf(m, "package %-22u: node %d\n", pkg,
+			   tlb_rep_node[pkg]);
+	seq_puts(m, "\n");
+	seq_puts(m, "Initiator side\n");
+	seq_puts(m, "--------------\n");
+	seq_printf(m, "flushes using rep path        : %llu\n",
+		   sum.rep_flushes);
+	seq_printf(m, "  of which kernel-range       : %llu\n",
+		   sum.kernel_rep_flushes);
+	seq_printf(m, "remote sockets forwarded      : %llu\n",
+		   sum.sockets_forwarded);
+	seq_printf(m, "remote cpus covered via rep   : %llu\n",
+		   sum.cpus_forwarded);
+	seq_printf(m, "cross-socket ipis saved       : %llu\n",
+		   sum.cpus_forwarded - sum.sockets_forwarded);
+	seq_printf(m, "single-target direct sends    : %llu\n",
+		   sum.singleton_direct);
+	seq_printf(m, "rep offline direct fallbacks  : %llu\n",
+		   sum.offline_fallbacks);
+	seq_puts(m, "\n");
+	seq_puts(m, "Receiver side\n");
+	seq_puts(m, "-------------\n");
+	seq_printf(m, "rep forwards executed         : %llu\n",
+		   sum.forwards_run);
+	seq_printf(m, "leaf ipis sent by reps        : %llu\n",
+		   sum.leaf_ipis_sent);
+	seq_printf(m, "leaf flushes executed         : %llu\n",
+		   sum.leaf_flushes_run);
+
+	return 0;
+}
+
+static ssize_t tlb_rep_proc_write(struct file *file, const char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	bool enable;
+	int err;
+
+	err = kstrtobool_from_user(buf, count, &enable);
+	if (err)
+		return err;
+
+	if (!tlb_rep_ready)
+		return -ENODEV;
+
+	if (enable)
+		static_branch_enable(&tlb_rep_key);
+	else
+		static_branch_disable(&tlb_rep_key);
+
+	return count;
+}
+
+static int tlb_rep_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, tlb_rep_proc_show, NULL);
+}
+
+static const struct proc_ops tlb_rep_proc_ops = {
+	.proc_open	= tlb_rep_proc_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write	= tlb_rep_proc_write,
+};
+
+static int __init tlb_rep_init(void)
+{
+	unsigned int cpu, pkg;
+	int err;
+
+	tlb_rep_pkgs = topology_max_packages();
+	if (tlb_rep_pkgs < 2)
+		return 0;
+
+	tlb_rep_node = kmalloc_array(tlb_rep_pkgs, sizeof(*tlb_rep_node),
+				     GFP_KERNEL);
+	if (!tlb_rep_node)
+		return -ENOMEM;
+
+	for (pkg = 0; pkg < tlb_rep_pkgs; pkg++)
+		tlb_rep_node[pkg] = NUMA_NO_NODE;
+
+	for_each_possible_cpu(cpu) {
+		struct tlb_rep_state *s = per_cpu_ptr(&tlb_rep_state, cpu);
+
+		s->reqs = kcalloc_node(tlb_rep_pkgs, sizeof(*s->reqs),
+				       GFP_KERNEL, cpu_to_node(cpu));
+		s->leaf_csds = alloc_percpu(call_single_data_t);
+		if (!s->reqs || !s->leaf_csds)
+			return -ENOMEM;
+		if (!zalloc_cpumask_var_node(&s->direct_mask, GFP_KERNEL,
+					     cpu_to_node(cpu)))
+			return -ENOMEM;
+
+		for (pkg = 0; pkg < tlb_rep_pkgs; pkg++) {
+			struct tlb_rep_request *req = &s->reqs[pkg];
+
+			INIT_CSD(&req->rep_csd, tlb_rep_forward_func, req);
+			req->leaf_csds = s->leaf_csds;
+			if (!zalloc_cpumask_var_node(&req->targets, GFP_KERNEL,
+						     cpu_to_node(cpu)))
+				return -ENOMEM;
+		}
+	}
+
+	err = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "x86/tlb_rep:online",
+				tlb_rep_online_cpu, NULL);
+	if (err < 0)
+		return err;
+
+	proc_create("tlb_rep", 0644, NULL, &tlb_rep_proc_ops);
+
+	tlb_rep_ready = true;
+	static_branch_enable(&tlb_rep_key);
+
+	return 0;
+}
+late_initcall(tlb_rep_init);
+
+#else
+
+static bool tlb_rep_flush_mask(const struct cpumask *cpumask,
+			       smp_call_func_t func,
+			       const struct flush_tlb_info *info,
+			       bool use_cond)
+{
+	return false;
+}
+
+#endif
+
 STATIC_NOPV void native_flush_tlb_multi(const struct cpumask *cpumask,
 					 const struct flush_tlb_info *info)
 {
@@ -1358,6 +1724,11 @@ STATIC_NOPV void native_flush_tlb_multi(const struct cpumask *cpumask,
 	else
 		trace_tlb_flush(TLB_REMOTE_SEND_IPI,
 				(info->end - info->start) >> PAGE_SHIFT);
+
+	if (tlb_rep_flush_mask(cpumask, flush_tlb_func, info,
+			       !info->freed_tables &&
+			       !mm_in_asid_transition(info->mm)))
+		return;
 
 	/*
 	 * If no page tables were freed, we can skip sending IPIs to
@@ -1496,7 +1867,8 @@ void flush_tlb_all(void)
 	/* First try (faster) hardware-assisted TLB invalidation. */
 	if (cpu_feature_enabled(X86_FEATURE_INVLPGB))
 		invlpgb_flush_all();
-	else
+	else if (!tlb_rep_flush_mask(cpu_online_mask, do_flush_tlb_all, NULL,
+				     false))
 		/* Fall back to the IPI-based invalidation. */
 		on_each_cpu(do_flush_tlb_all, NULL, 1);
 }
@@ -1534,7 +1906,8 @@ static void kernel_tlb_flush_all(struct flush_tlb_info *info)
 {
 	if (cpu_feature_enabled(X86_FEATURE_INVLPGB))
 		invlpgb_flush_all();
-	else
+	else if (!tlb_rep_flush_mask(cpu_online_mask, do_flush_tlb_all, NULL,
+				     false))
 		on_each_cpu(do_flush_tlb_all, NULL, 1);
 }
 
@@ -1542,7 +1915,8 @@ static void kernel_tlb_flush_range(struct flush_tlb_info *info)
 {
 	if (cpu_feature_enabled(X86_FEATURE_INVLPGB))
 		invlpgb_kernel_range_flush(info);
-	else
+	else if (!tlb_rep_flush_mask(cpu_online_mask, do_kernel_range_flush,
+				     info, false))
 		on_each_cpu(do_kernel_range_flush, info, 1);
 }
 
